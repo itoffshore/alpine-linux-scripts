@@ -4,6 +4,7 @@ PREFIX=
 . "$PREFIX/lib/libalpine.sh"
 
 MBR=${MBR:-"/usr/share/syslinux/mbr.bin"}
+GPTMBR=${GPTMBR:-"/usr/share/syslinux/gptmbr.bin"}
 ROOTFS=${ROOTFS:-ext4}
 BOOTFS=${BOOTFS:-ext4}
 VARFS=${VARFS:-ext4}
@@ -43,6 +44,14 @@ uuid_or_device() {
 	case "$1" in
 		/dev/md*) echo "$1" && return 0;;
 	esac
+	# crypted devices need a device mapper in fstab not an LVM volume
+	if [ -n "$CRYPTDM" ]; then
+		if echo $1| grep "^/dev/$(find_luks_vg)/" 1> /dev/null; then
+	                echo "$(convert_vg_to_mapper $1)" && return 0
+		elif echo $1| grep "^/dev/mapper/" 1>/dev/null; then
+			echo "$1" && return 0
+		fi
+	fi
 	for i in $(_blkid "$1"); do
 		case "$i" in
 			UUID=*) eval $i;;
@@ -75,7 +84,12 @@ is_vmware() {
 
 # return true (0) if given device is lvm
 is_lvm() {
-	lvs "$1" >/dev/null 2>&1
+	local lvmdev="$1"
+	#lvs does not return true for /dev/mapper/xxx-xxx
+	if echo "$lvmdev" |grep "/dev/mapper/" |grep "-" 1>/dev/null; then
+		lvmdev=$(convert_mapper_to_lvm $1)
+	fi
+	lvs "$lvmdev" >/dev/null 2>&1
 }
 
 # Find the disk device from given partition
@@ -151,8 +165,13 @@ supported_boot_fs() {
 }
 
 find_volume_group() {
-	local lv=${1##*/}
-	lvs --noheadings "$1" | awk "\$1 == \"$lv\" {print \$2}"
+	#lvs does not return true for /dev/mapper/xxx-xxx
+	if echo "$1" |grep "/dev/mapper/" 1>/dev/null; then
+		echo "$(find_vg_by_device $1)"
+	else
+		local lv=${1##*/}
+		lvs --noheadings "$1" | awk "\$1 == \"$lv\" {print \$2}"
+	fi
 }
 
 find_pvs_in_vg() {
@@ -214,6 +233,9 @@ install_mounted_root() {
 		pvs=$(find_pvs_in_vg $vg)
 	fi
 
+	if [ -n "$CRYPTDM" ]; then
+		initfs_features="$initfs_features cryptsetup"
+	fi
 
 	bootdev=$(find_mount_dev "$mnt"/boot)
 	if [ -z "$bootdev" ]; then
@@ -286,6 +308,10 @@ install_mounted_root() {
 	fi
 	if has_bootopt nomodeset; then
 		kernel_opts="nomodeset $kernel_opts"
+	fi
+	if [ -n "$CRYPTDM" ]; then
+		kernel_opts="$kernel_opts cryptroot=$CRYPTROOT cryptdm=$CRYPTDM"
+		setup_crypttab
 	fi
 	modules="sd-mod,usb-storage,${root_fs}${raidmod}"
 	sed -e "s:^root=.*:root=$root:" \
@@ -441,7 +467,7 @@ init_progs() {
 	xfs) fstools=xfsprogs; mkfs_args="-q";;
 	btrfs) fstools=btrs-progs; mkfs_args="";;
 	esac
-	apk add --quiet sfdisk e2fsprogs lvm2 $raidpkg syslinux $fstools $@
+	apk add --quiet sfdisk gptfdisk e2fsprogs lvm2 $raidpkg syslinux $fstools $@
 }
 
 show_disk_info() {
@@ -488,7 +514,11 @@ setup_partitions() {
 	echo "w" | fdisk $diskdev >/dev/null
 
 	# fix the MBR while here so extlinux can boot
-	cat "$MBR" > $diskdev
+        if [ "$(check_scheme $diskdev)" = "dos" ]; then
+                cat "$MBR" > $diskdev
+        elif [ "$(check_scheme $diskdev)" = "gpt" ]; then
+                cat "$GPTMBR" > $diskdev
+        fi
 
 	local start=1M
 	local line=
@@ -506,14 +536,34 @@ setup_partitions() {
 
 # find the bootable partition on given disk
 find_boot_partition() {
-	sfdisk -d $1 | awk '/bootable/ {print $1}'
+	if [ "$(check_scheme $1)" = "dos" ]; then
+		sfdisk -d $1 | awk '/bootable/ {print $1}'
+	else
+		local i=1; while [ $i -le 128 ]; do
+			if sgdisk $1 -A $i:show |grep "legacy BIOS bootable" 1>/dev/null; then
+				echo "${ACTIVE_DISK}${i}"
+				break
+			fi
+			i=$(( $i + 1 ))
+		done
+	fi
 }
 
 # find the partition(s) for LVM
 # this is not marked as bootable and is type 8e
 find_lvm_partition() {
-	local type=8e
-	sfdisk -d $1 | grep -v bootable | awk "/(Id|type)=$type/ {print \$1}"
+	if [ "$(check_scheme $1)" = "dos" ]; then
+		local type=8e
+		sfdisk -d $1 | grep -v bootable | awk "/(Id|type)=$type/ {print \$1}"
+	else
+		local part= type=8E00
+		for part in $(list_partitions); do
+			if [ "$(find_part_type $part)" = "$type" ]; then
+				echo "/dev/$part"
+				break
+			fi
+		done
+	fi
 }
 
 # set up optional raid and create filesystem on boot device.
@@ -658,6 +708,132 @@ setup_mdadm_conf() {
 		done
 	fi
 }
+
+find_mount_point() {
+	local device=$1
+	awk "\$1 == \"$device\" {print \$2}" /proc/mounts | tail -n 1
+}
+
+find_mapper_disk() {
+	cryptsetup status $1|grep device|awk '{ print $2 }'
+}
+
+find_luks_vg() {
+	if is_luks_pv; then
+		pvs --noheadings /dev/mapper/$CRYPTDM |awk '{ print $2 }'
+	fi
+}
+
+find_part_type() {
+	local part_number=$(echo $1 |tr -cd '[:digit:]')
+	local disk=$(echo $1 |tr -d '[:digit:]')
+	sgdisk "/dev/$disk" -p |sed '1,/Code/d' |awk -v TEST="$part_number" '$1 == TEST { print $6 }'
+}
+
+list_partitions() {
+	echo $(lsblk $1 -no NAME,SIZE,TYPE |iconv -c -f utf-8 -t ascii|tr -d '[:*:]' |awk '$3 = /part/ && $2 != "1K" { print $1}')
+}
+
+check_scheme() {
+	fdisk -l $1 |grep "Disklabel type:" |awk '{ print $3 }'
+}
+
+is_luks_pv() {
+	pvs --noheadings|awk '{ print $1 }'| grep -w $CRYPTDM &>/dev/null
+}
+
+find_vg_by_device() {
+	local device=${1##*/}
+	local index=$(expr index ${device##*/} "-" - 1)
+	local vg=${device::$index}
+	echo $vg
+}
+
+find_lv_by_device() {
+	local device=${1##*/}
+	local index=$(expr index ${device##*/} "-")
+	local lv=${device:$index}
+	echo $lv
+}
+
+convert_mapper_to_lvm() {
+	local mapper=$1
+	local vg=$(find_vg_by_device $mapper)
+	local lv=$(find_lv_by_device $mapper)
+	echo "/dev/$vg/$lv"
+}
+
+convert_vg_to_mapper() {
+	local mapper=${1##*/}
+	local vg=$(find_luks_vg)
+	echo "/dev/mapper/$vg-$mapper"
+}
+
+convert_lv_to_device() {
+	local lv=${1##*/} local vg=$(find_luks_vg)
+	if [ -n "$(find_mount_point /dev/$vg/$lv)" ]; then
+		echo "/dev/$vg/$lv"
+	elif [ -n "$(find_mount_point /dev/mapper/$vg-$lv)" ]; then
+		echo "/dev/mapper/$vg-$lv"
+	fi
+}
+
+setup_crypttab() {
+	local keysdir=${keysdir:-$mnt/etc/luks-keys}
+	local keyfile= local answer= local i=
+	local config=$mnt/etc/conf.d/dmcrypt
+
+	if [ -f "$mnt"/etc/crypttab ]; then
+		mv "$mnt"/etc/crypttab "$mnt"/etc/crypttab.old
+	fi
+
+	if [ $(echo $DMLIST|wc -w) -gt 1 ]; then
+		read -p "Setup LUKS keyfiles for automatic mounting? [y/N]: " answer
+		case "$answer" in
+	        y*|Y*) mkdir -p $mnt/etc/conf.d; cp ${config#$mnt} $config
+			ln -s /etc/init.d/dmcrypt $mnt/etc/runlevels/boot/dmcrypt 2>/dev/null
+			read -p "Enter directory for keys [ ${keysdir#$mnt} ]: " answer
+			until [ -d "$keysdir" ]; do
+				if [ -n "$answer" ]; then keysdir=$mnt$answer; fi
+				mkdir -p $keysdir
+			done; echo "Creating $keysdir"
+			for i in $DMLIST; do
+				if [ "$i" != "$CRYPTDM" ]; then
+					read -p "Create key for /dev/mapper/$i [y/N]? : " answer
+					case "$answer" in
+					  y*|Y*) if ! cryptsetup luksDump $(find_mapper_disk $i)|grep ": DISABLED" 1>/dev/null; then
+							echo "All keyslots full: Choose slot to wipe? [1-7]:"
+							until [ $answer -ge 1 2>/dev/null ] && [ $answer -le 7 2>/dev/null ]; do
+								echo -en "\033[1;31m>>>\033[37m: \033[0m"; read answer
+								echo -en "\033[1A\033[K" #move the cursor & clear the line
+							done
+							cryptsetup luksKillSlot $(find_mapper_disk $i) $answer
+						fi
+						dd if=/dev/urandom of=$keysdir/$i bs=1024 count=4
+						cryptsetup luksAddKey $(find_mapper_disk $i) $keysdir/$i
+						echo -e "\n## Settings from /sbin/setup-disk" >> $config
+						echo "target=$i" >> $config
+						echo "source=$(find_mapper_disk $i)" >> $config
+						echo "key=${keysdir#$mnt}/$i" >> $config
+					esac
+				fi
+			done
+			chmod -R 400 $keysdir;chown -R root:root $keysdir
+		esac
+	fi
+
+	for i in $DMLIST; do
+		if [ -f "$keysdir/$i" ];then
+			keyfile="${keysdir#$mnt}/$i"
+		else
+			keyfile="none"
+		fi
+		# crypttab needs the UUID of the physical device
+		echo "# $i is on $(find_mapper_disk $i)" >> $mnt/etc/crypttab
+		echo "$i $(_blkid $(find_mapper_disk $i)|awk '{ print $2 }') $keyfile luks" >> $mnt/etc/crypttab
+	done
+}
+
 
 data_only_disk_install_lvm() {
 	local diskdev=
@@ -911,6 +1087,7 @@ options:
  -q  Exit quietly if no disks are found
  -r  Enable software raid1 with single disk
  -s  Use SWAPSIZE MB instead of autodetecting swap size (Use 0 to disable swap)
+ -E  Use Encrypted LUKS devices (LVM or Standard Partitions are supported)
  -v  Be more verbose about what is happening
 
 __EOF__
@@ -927,7 +1104,7 @@ esac
 DISK_MODE=
 USE_LVM=
 # Parse args
-while getopts "hk:Lm:o:qrs:v" opt; do
+while getopts "hk:Lm:o:qrs:vE" opt; do
 	case $opt in
 		m) DISK_MODE="$OPTARG";;
 		k) KERNEL_FLAVOR="$OPTARG";;
@@ -937,10 +1114,78 @@ while getopts "hk:Lm:o:qrs:v" opt; do
 		r) USE_RAID=1;;
 		s) SWAP_SIZE="$OPTARG";;
 		v) VERBOSE=1;;
+		E) CRYPTROOT=1;;
 		*) usage;;
 	esac
 done
 shift $(( $OPTIND - 1))
+
+if [ -n "$CRYPTROOT" ]; then
+	DMLIST=$(dmsetup ls --target crypt|awk '{ print $1 }')
+	if [ -z "$DMLIST" ]; then echo "No Crypt Devices found."; exit 1; fi
+	echo -en "\033[1;4m\nSelect LUKS ROOT Device Mapper:\033[0m\n\n\033[1m$DMLIST\033[0m\n\n"
+
+	until echo "$DMLIST" | grep -w "$CRYPTDM" 1>/dev/null; do
+		echo -en "\033[1;32m>>>\033[37m: \033[0m"; read CRYPTDM;
+		echo -en "\033[1A\033[K" #move the cursor & clear the line
+	done
+
+	CRYPTROOT=$(find_mapper_disk $CRYPTDM)
+	CRYPTDISK=$(echo $CRYPTROOT | tr -d '[:digit:]')
+
+	apk add --quiet sfdisk gptfdisk
+	if [ -z $(find_boot_partition $CRYPTDISK) ]; then
+		echo "No Boot Device detected."; exit 1
+	fi
+	if ! grep "$(find_boot_partition $CRYPTDISK)" /proc/mounts 1>/dev/null; then
+		echo "Boot Device '$(find_boot_partition $CRYPTDISK)' is not mounted."; exit 1
+	fi
+
+	if is_luks_pv; then
+		if [ -z "$(find_lvm_partition $CRYPTDISK)" ]; then
+			if [ "$(check_scheme $CRYPTDISK)" = "dos" ]; then
+				echo "$CRYPTROOT partition is not set to type 8e."; exit 1
+			else
+				echo "$CRYPTROOT partition is not set to type 8e00."; exit 1
+			fi
+		fi
+	fi
+
+	if [ ! "$1" ]; then
+		if is_luks_pv; then
+			lvscan |awk '{ print $2,$3,$4 }' |sed "s/'//g"
+			echo -en "\nSelect root device?\n\n"					# rows to columns
+			part_list=$(lvscan |awk '{ print $2 }' |sed "s:/dev/$(find_luks_vg)/::g"|tr "\n" " ")
+			until [ -n "$(find_mount_point $(convert_lv_to_device $answer))" &>/dev/null ]; do
+				if [ -n "$answer" ]; then echo -e "\033[1;31m$answer: not mounted";sleep 1;echo -en "\033[1A\033[K";fi
+				echo -en "\033[1;32m>>>\033[37m[ $part_list]: \033[0m"; read answer
+				echo -en "\033[1A\033[K"
+			done
+			SYSROOT=$(find_mount_point $(convert_lv_to_device $answer))
+		else
+			SYSROOT=$(find_mount_point /dev/mapper/$CRYPTDM)
+		fi
+		if [ -n "$SYSROOT" ]; then
+			set $SYSROOT
+		else
+			echo "Device '$CRYPTDM' is not mounted."; exit 1
+		fi
+		echo "root device = $(convert_lv_to_device $answer)"
+        else
+		if [ -z "$(find_mount_dev $1)" ]; then
+			echo "No filesystem mounted @ $1"; exit 1
+		else
+			SYSROOT=$1
+		fi
+	fi
+
+        if [ -n "$(find_lvm_partition)" ]; then
+                rc-update add lvm boot
+        fi
+        echo "root device = $(find_mount_dev $SYSROOT)"
+        echo "cryptdm = $CRYPTDM"
+        echo "cryptroot = $CRYPTROOT mounted@: $1"
+fi
 
 if [ -d "$1" ]; then
 	# install to given mounted root
