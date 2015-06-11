@@ -1170,7 +1170,6 @@ if [ -n "$CRYPTROOT" ]; then
 		else
 			echo "Device '$CRYPTDM' is not mounted."; exit 1
 		fi
-		echo "root device = $(convert_lv_to_device $answer)"
         else
 		if [ -z "$(find_mount_dev $1)" ]; then
 			echo "No filesystem mounted @ $1"; exit 1
@@ -1179,12 +1178,12 @@ if [ -n "$CRYPTROOT" ]; then
 		fi
 	fi
 
-        if [ -n "$(find_lvm_partition)" ]; then
-                rc-update add lvm boot
-        fi
-        echo "root device = $(find_mount_dev $SYSROOT)"
-        echo "cryptdm = $CRYPTDM"
-        echo "cryptroot = $CRYPTROOT mounted@: $1"
+	if [ -n "$(find_lvm_partition)" ]; then
+		rc-update add lvm boot
+	fi
+	echo "root device = $(find_mount_dev $SYSROOT)"
+	echo "cryptdm = $CRYPTDM"
+	echo "cryptroot = $CRYPTROOT mounted@: $1"
 fi
 
 if [ -d "$1" ]; then
