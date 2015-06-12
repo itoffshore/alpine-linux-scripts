@@ -312,7 +312,6 @@ install_mounted_root() {
 	if [ -n "$CRYPTDM" ]; then
 		kernel_opts="$kernel_opts cryptroot=$CRYPTROOT cryptdm=$CRYPTDM"
 		setup_crypttab
-		SWAP_DEVICE=$(grep ^/dev/ /proc/swaps |awk '{print $1}' |head -1)
 	fi
 	modules="sd-mod,usb-storage,${root_fs}${raidmod}"
 	sed -e "s:^root=.*:root=$root:" \
@@ -325,6 +324,9 @@ install_mounted_root() {
 	fi
 
 	# generate the fstab
+	if [ -z "$SWAP_DEVICE" ]; then
+                SWAP_DEVICE=$(grep ^/dev/ /proc/swaps |awk '{print $1}' |head -1)
+        fi
 	if [ -f "$mnt"/etc/fstab ]; then
 		mv "$mnt"/etc/fstab "$mnt"/etc/fstab.old
 	fi
