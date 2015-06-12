@@ -324,8 +324,8 @@ install_mounted_root() {
 	fi
 
 	# generate the fstab
-	if [ -z "$SWAP_DEVICE" ]; then
-                SWAP_DEVICE=$(grep ^/dev/ /proc/swaps |awk '{print $1}' |head -1)
+	if [ -z "$SWAP_DEVICE" ] && [ -n "$(grep ^/dev/ /proc/swaps |awk '{print $1}' |head -1)" ]; then
+                SWAP_DEVICE=$(uuid_or_device $(grep ^/dev/ /proc/swaps |awk '{print $1}' |head -1))
         fi
 	if [ -f "$mnt"/etc/fstab ]; then
 		mv "$mnt"/etc/fstab "$mnt"/etc/fstab.old
@@ -334,6 +334,7 @@ install_mounted_root() {
 	if [ -n "$SWAP_DEVICE" ]; then
 		echo -e "${SWAP_DEVICE}\tswap\tswap\tdefaults\t0 0" \
 			>> "$mnt"/etc/fstab
+		ln -s /etc/init.d/swap $mnt/etc/runlevels/boot/swap 2>/dev/null
 	fi
 	cat >>"$mnt"/etc/fstab <<EOF
 /dev/cdrom	/media/cdrom	iso9660	noauto,ro 0 0
