@@ -1,0 +1,1040 @@
+#!/bin/sh
+
+MBR=${MBR:-"/usr/share/syslinux/mbr.bin"}
+GPTMBR=${GPTMBR:-"/usr/share/syslinux/gptmbr.bin"}
+ROOTFS=${ROOTFS:-ext4}
+BOOTFS=${BOOTFS:-ext2}
+
+# default location for mounted root
+SYSROOT=${SYSROOT:-/mnt}
+
+ACTIVE_DISK=
+ACTIVE_DEV=
+ACTIVE_MNT=
+ACTIVE_FS=
+ACTIVE_TYPE=
+MSG=
+
+init_progs_luks() {
+	local i=
+
+	if [ "$(cat /sys/class/net/eth0/operstate)" != "up" ]; then
+		setup-interfaces
+		ifup eth0
+	fi
+	if [ ! "$(basename $(grep "^http://" /etc/apk/repositories))" = "main" ]; then
+		setup-apkrepos; echo -e;
+	fi
+	pkgs="nano haveged lvm2 cryptsetup sfdisk cfdisk gptfdisk e2fsprogs syslinux"
+	for i in $pkgs; do
+		if ! grep "^$i" /etc/apk/world 1>/dev/null; then
+			echo -e "Installing applications for setup ...\n"
+			apk add --quiet --progress $pkgs
+			break
+		fi
+	done
+	if [ ! -f "/var/run/haveged.pid" ]; then rc-service haveged restart; echo -e; fi
+}
+
+confirm_wipe() {
+	#wipe partition with random data
+	echo -n "Wipe LUKS partition: '$1' with random data? [y/N]: "
+	read answer
+	case "$answer" in
+		y*|Y*) `haveged -n 0 | dd of=$1`; return 0;;
+	esac
+}
+
+# wrapper to only show given device
+_blkid() {
+	blkid | grep "^$1:"
+}
+
+find_mapper_disk() {
+	cryptsetup status $1|grep device|awk '{ print $2 }'
+}
+
+find_crypts() {
+	if [ "$(dmsetup ls --target=crypt)" != "No devices found" ]; then
+		dmsetup ls --target=crypt |awk '{print $1}'
+	fi
+}
+
+find_dm_by_device() {
+	local crypt_list=$(find_crypts)
+	local dm= device=$1
+
+	for dm in $crypt_list; do
+		if [ "$(find_mapper_disk $dm)" = "$device" ]; then
+			echo "/dev/mapper/$dm"; exit 0
+		fi
+	done
+}
+
+find_vg_by_device() {
+	local device=${1##*/}
+	local index=$(expr index ${device##*/} "-" - 1)
+	local vg=${device::$index}
+	echo $vg
+}
+
+find_lv_by_device() {
+	local device=${1##*/}
+	local index=$(expr index ${device##*/} "-")
+	local lv=${device:$index}
+	echo $lv
+}
+
+find_fs() {
+	blkid -o value -s TYPE $1
+}
+
+convert_mapper_to_lvm() {
+	local mapper="$1"
+	local vg=$(find_vg_by_device $mapper)
+	local lv=$(find_lv_by_device $mapper)
+	echo "/dev/$vg/$lv"
+}
+
+# find device for given mounted dir
+find_mount_dev() {
+	local mnt="$1"
+	awk "\$2 == \"$mnt\" { print \$1 }" /proc/mounts | tail -n 1
+}
+
+find_mount_point() {
+	local device="$1"
+	awk "\$1 == \"$device\" {print \$2}" /proc/mounts | tail -n 1
+}
+
+requested_mnt_fs() {
+	local device="$1"
+	awk "\$1 == \"$device\" {print \$2,\$3}" /tmp/mnt_list.in 2>/dev/null | tail -n 1
+}
+
+find_mount_fs() {
+	local mnt="$1"
+	awk "\$2 == \"$mnt\" {print \$3}" /proc/mounts | tail -n 1
+}
+
+find_lvm_partition() {
+	if [ "$(check_scheme $ACTIVE_DISK)" = "dos" ]; then
+		local type=8e
+		sfdisk -d $1 | awk "/Id=$type/ {print \$1}"
+	else
+		local part= type=8E00
+		for part in $(list_partitions); do
+			if [ "$(find_part_type $part)" = "$type" ]; then
+				echo "/dev/$part"
+				break
+			fi
+		done
+	fi
+}
+
+find_boot_partition() {
+	if [ "$(check_scheme $ACTIVE_DISK)" = "dos" ]; then
+		sfdisk -d $ACTIVE_DISK | awk '/bootable/ {print $1}'
+	else
+		local i=1; while [ $i -le 128 ]; do
+			if sgdisk $ACTIVE_DISK -A $i:show |grep "legacy BIOS bootable" 1>/dev/null; then
+				echo "${ACTIVE_DISK}${i}"
+				break
+			fi
+			i=$(( $i + 1 ))
+		done
+	fi
+}
+
+find_vg() {
+	local device="$1"
+	if is_pv $device; then
+		if [ $(pvs --noheadings $device | wc -w) = 6 ]; then
+			pvs --noheadings $device |awk '{ print $2 }'
+		fi
+	fi
+}
+
+is_pv() {
+	pvs "$1" &>/dev/null
+}
+
+find_pvs_in_vg() {
+	local vg="$1"
+	pvs --noheadings | awk "\$2 == \"$vg\" {print \$1}"
+}
+
+find_dev_type() {
+	local device=$(basename $1)       # remove unicode
+	lsblk -no NAME,TYPE $ACTIVE_DISK 2>/dev/null | iconv -c -f utf-8 -t ascii|tr -d '[:*:]' |awk "\$1 == \"$device\" {print \$2}"
+}
+
+detect_mounts() {
+	local device= part= uuid= mnt= fs= mlist=/tmp/mnt_list.in
+	local device_list=$(list_devices)
+
+	for part in $device_list; do
+		device=$(device_from_name $part)
+		uuid=$(_uuid $device)
+		mnt=$(find_mount_point $device)
+		fs=$(find_fs $device)
+		if [ -n "$mnt" ]; then
+			echo "$device $mnt $fs $uuid" >> $mlist
+		elif [ "$(find_fs $device)" = "swap" ]; then
+			echo "$device swap swap $uuid" >> $mlist
+		elif [ "$(find_part_type $part)" = "EF02" ]; then
+			echo "$device GPT-BIOS $fs $uuid" >> $mlist
+		fi
+	done
+}
+
+unmount_parts() {
+	local line=
+	local config=/tmp/rootdev.last
+	local mlist=/tmp/mnt_list.in
+
+	if [ -f $mlist ]; then # create list with root partition LAST & longest path FIRST
+		awk '{ print length ($2), $1, $2, $3 }' $mlist | sort -nr | cut -d" " -f2- > $config
+
+		while read line        #$1 = device
+		do                     #$2 = mount point
+			set -- $line   #$3 = file system
+			if [ -n "$(find_mount_point $1)" ]; then
+				echo "unmounting $1 @ $2"; umount $2 2>/dev/null
+			elif grep ^$1 /proc/swaps 1>/dev/null; then
+				swapoff $1
+			fi
+		done < $config
+	fi
+}
+
+mount_parts() {
+	local line=
+	local config=/tmp/rootdev.first
+	local mlist=/tmp/mnt_list.in
+	local no_mount_list="swap GPT-BIOS"
+
+	if [ -f $mlist ]; then # create list with root partition FIRST & longest path LAST
+		awk '{ print length ($2), $1, $2, $3 }' $mlist | sort -n | cut -d" " -f2- > $config
+
+		while read line		#$1 = device
+		do		        #$2 = mount point
+			set -- $line	#$3 = file system
+			if ! echo "$no_mount_list" |grep -w $2 1>/dev/null; then
+				echo "mounting $1 @ $2";
+				mkdir -p $2; mount -t $3 $1 $2;
+			fi
+		done < $config
+		echo -e; lsblk -e 1,7,11 -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,PARTLABEL,UUID
+	else
+		echo "$mlist is missing"
+	fi
+}
+
+tidy_mounts() {
+	local device= fstype= mnt_list= device_list= msgfile=/tmp/part.msg
+	local config=/tmp/mnt_list.in
+
+	if [ -f "$config" ]; then
+		mnt_list=$(awk '{ print $1 }' $config)
+		device_list=$(device_from_name $(list_devices))
+
+		for device in $mnt_list; do
+			fstype=$(find_fs $device)                            # mappers are mounted not crypt disks or pv's
+			if ! echo $device_list |grep $device 1>/dev/null || echo $fstype |egrep -w -q "LVM2_member|crypto_LUKS"; then
+				echo "$device removed from mount queue" >> $msgfile
+				sed -i "\|^$device|d" $config
+			fi              # note delimiter escaped
+		done
+	fi
+	if [ $(cat $msgfile 2>/dev/null |wc -l) -gt 0 ]; then echo -e >> $msgfile; fi
+}
+
+format_warning() {
+	local answer= config=/tmp/mnt_list.in
+
+	if [ -f "$config" ]; then
+		awk '$3 != /none/ { print $1,$3}' $config
+		echo -en "\nFormat the above partitions? [ y/N ] : "; read answer
+		case "$answer" in
+			y*|Y*) format_parts;;
+			    *) exit 1;;
+		esac
+	else
+		exit 1
+	fi
+}
+
+format_parts() {
+	local line= config=/tmp/mnt_list.in
+	local fs_list="ext2 ext3 ext4 swap btrfs"
+		            #$1 = device
+	while read line; do #$2 = mount point
+	set -- $line        #$3 = file system
+	if echo $fs_list |grep $3 1>/dev/null; then
+		echo "formatting $1 as $3"
+		case "$3" in
+		      ext*) mkfs.$3 -q $1;;
+		      swap) mkswap $1;swapon $1;;
+		     btrfs) mkfs.$3 -q $1;;
+		         *) echo "NOT formatting $1";;
+		esac
+	fi
+	done < $config
+}
+
+set_lvm_type() {
+	local part= type= part_number=
+
+	for part in $(pvs --noheading |awk '{print $1}'); do
+		if echo $part |grep "^/dev/mapper/" 1>/dev/null; then
+			part=$(find_mapper_disk $part)
+		fi
+
+		type=$(find_part_type $part)
+		part_number=$(echo $part |tr -cd '[:digit:]')
+
+		if [ "$type" != "8E00" ]; then
+			case "$(check_scheme $ACTIVE_DISK)" in
+			   gpt) echo "Correcting $part to partition type: 8e00"
+				sgdisk $ACTIVE_DISK --typecode ${part_number}:8e00;;
+			   dos) echo "Correcting $part to partition type: 8e"
+				sfdisk --part-type $ACTIVE_DISK ${part_number} 8e;;
+			esac
+		fi
+	done
+}
+
+set_swap_type() {
+        local part= type= part_number=
+
+        for part in $(grep ^$ACTIVE_DISK /proc/swaps |awk '{print $1}'); do
+                if echo $part |grep "^$ACTIVE_DISK[[:digit:]\?]" 1>/dev/null; then
+                        type=$(find_part_type $part)
+                        part_number=$(echo $part |tr -cd '[:digit:]')
+
+                        if [ "$type" != "8200" ]; then
+                                case "$(check_scheme $ACTIVE_DISK)" in
+                                   gpt) echo "Correcting $part to partition type: 8200"
+                                        sgdisk $ACTIVE_DISK --typecode ${part_number}:8200;;
+                                   dos) echo "Correcting $part to partition type: 82"
+                                        sfdisk --part-type $ACTIVE_DISK ${part_number} 82;;
+				esac
+			fi
+		fi
+	done
+}
+
+create_crypt(){
+	local device=$1
+	local answer= config=/tmp/mnt_list.in
+
+	if ! cryptsetup isLuks $device 2>/dev/null; then
+		echo -ne "Create LUKS device on '$device'? [ y/N ] : "; read answer
+		case $answer in
+		   y*|Y*) if is_pv $device; then
+				read -p "$device is an LVM pv. Destroy by creating a LUKS device? [ y/N ] : " answer
+				case $answer in
+				      y*|Y*) manage_pv $device remove;;
+				esac
+			  fi
+			  if [ $? -eq 0 ]; then
+				confirm_wipe $device
+				cryptsetup -v -c serpent-xts-plain64 -s 512 --hash whirlpool \
+					--iter-time 5000 --use-random luksFormat $device;
+				tidy_mounts $device
+			  fi;;
+		esac
+	fi
+}
+
+wipe_crypt() {
+	local device=$1
+	local msgfile=/tmp/part.msg
+	local cryptdisk=$(find_mapper_disk $device)
+
+	vgchange -a n &>/dev/null
+	cryptsetup close $device
+	dd if=/dev/zero count=2048 of=$cryptdisk &>/dev/null
+	activate_vgs
+	echo -e "LUKS header on '$device' wiped" >> $msgfile
+	tidy_mounts
+}
+
+close_all_crypts() {
+	local crypt_list=$(dmsetup ls --target crypt |awk '{ print $1 }')
+
+	for mapper in $crypt_list; do
+		if cryptsetup status $mapper &>/dev/null; then
+			echo "closing LUKS device: $mapper"
+			cryptsetup close $mapper
+		fi
+	done
+}
+
+open_crypt() {
+	local device="$1"
+	local mapper=$(find_dm_by_device $device)
+
+	if [ -z "$mapper" ]; then
+		read -p "Enter LUKS device mapper name: " mapper
+	fi
+	if ! cryptsetup status $mapper &>/dev/null; then
+		cryptsetup open --type=luks $device $(sanitize_name $mapper)
+	fi
+}
+
+create_pv() {
+	local mapper="$1"
+	local answer=
+
+	if ! is_pv $mapper; then
+		pvcreate $mapper
+		tidy_mounts $mapper
+	fi
+}
+
+create_vg() {
+	local pv="$1"
+	local vg=$(find_vg $pv)
+	local answer=
+
+	if [ -z "$vg" ]; then
+		read -p "Create LVM volume group on LVM PV '$pv'? [y/N] : " answer
+		case $answer in
+		   y*|Y*) until [ -n "$(find_vg $pv)" ]; do
+				read -p "Enter name for LVM volume group? : " vg
+				vgcreate $vg $pv
+			  done;;
+		       *) return 1;;
+		esac
+	fi
+	activate_vgs
+}
+
+free_vg(){
+	local vg=$1
+	vgs --noheadings $vg|awk '{ print $7 }'
+}
+
+activate_vgs() {
+	if lvscan 2>/dev/null |grep -w inactive 1>/dev/null; then
+		vgchange -a y &>/dev/null
+	fi
+}
+
+create_lv() {
+	local mapper=$1
+	local vg=$(find_vg $mapper)
+	local lv= size= answer= msgfile=/tmp/lvm.msg
+
+	if [ "$(free_vg $vg)" != "0" ]; then
+		read -p "Enter name for new logical volume? <'q' to quit> : " lv
+		if echo $lv|egrep "^q|^Q" 1>/dev/null; then break; fi
+		lv=$(sanitize_name $lv)
+	        read -p "Enter size for logical volume $lv ('xxxM' or 'x.xG' or 'xxx%{VG|PVS|FREE|ORIGIN}') ? : " size
+		case $size in
+			q*|Q*) break;;
+		*%VG|*%PVS|*%FREE|*%ORIGIN) lvcreate -l $size $vg -n $lv 1>$msgfile;;
+		*m|*M|*g|*G|*t|*T|*p|*P|*e|*E) lvcreate -L $size $vg -n $lv 1>$msgfile;; #must be 2nd or 100%FREE matches on *E
+		esac
+	else
+		echo -en "\033[1A\033[K\033[1;31mvolume group '$vg' has no free space.\033[0m";sleep 1;echo -en "\n\033[1A"
+	fi
+}
+
+delete_resize_lv() {
+	local mapper=$1
+	local vg=$(find_vg $mapper)
+	local size= lv= config=/tmp/mnt_list.in
+	local answer=$2 lvmmsg=/tmp/lvm.msg			# rows to columns
+	local lv_list=$(lvs --noheadings $vg|awk '{ print $1 }'|tr "\n" " ")
+
+	if [ -n "$lv_list" ]; then
+		echo -en "\n\033[4m$question on '$vg'? [ q to Quit ]\033[0m\n"
+		until echo "$lv_list" | grep -w "$lv" 1>/dev/null; do
+			echo -en "\033[1;32m>>>\033[37m[ $lv_list ]: \033[0m"; read lv
+			echo -en "\033[1A\033[K" #move the cursor & clear the line
+			if echo $lv|egrep "^q|^Q" 1>/dev/null; then answer=cancel; break; fi
+		done
+
+		case $answer in
+	        r*|R*) read -p "Enter new size for '$lv' ( +/-size || xxxM or x.xG || xxx%{VG|LV|PVS|FREE|ORIGIN} ) ? : " size
+			case $size in
+		        q*|Q*) break;;
+		        *%VG|*%LV|*%PVS|*%FREE|*%ORIGIN) if echo "$(find_fs $mapper)" | egrep -q -w  "ext2|ext3|ext4|btrfs"; then
+								lvresize --resizefs -l $size /dev/$vg/$lv 1>$lvmmsg
+							 else
+								lvresize -l $size /dev/$vg/$lv 1>$lvmmsg
+							 fi;;
+                               #must be 2nd or 100%FREE matches *E
+		          *m|*M|*g|*G|*t|*T|*p|*P|*e|*E) if echo "$(find_fs $mapper)" | egrep -q -w  "ext2|ext3|ext4|btrfs"; then
+								lvresize --resizefs -L $size /dev/$vg/$lv 1>$lvmmsg
+							 else
+								lvresize -L $size /dev/$vg/$lv 1>/$lvmmsg
+							 fi;;
+			esac
+			;;
+                d*|D*) lvremove $vg/$lv 1>$lvmmsg;
+		       tidy_mounts "/dev/mapper/$vg-$lv";;
+		esac
+	else
+		echo -en "\033[1A\033[K\033[1;31mvolume group '$vg' has no logical volumes.\033[0m";sleep 1;echo -en "\n\033[1A"
+	fi
+}
+
+manage_pv() {
+	local pv="$1"
+	local action="$2"
+	local vg=$(find_vg $pv)
+	local total_pv=$(find_pvs_in_vg $vg |wc -w)
+
+	case "$action" in
+	    remove) if [ $total_pv -gt 1 ]; then
+			if [ $? -eq 0 ]; then vgreduce $vg $pv; fi
+			if [ $? -eq 0 ]; then pvremove $pv; else return 1; fi
+		    elif [ $total_pv -eq 1 ]; then
+			vgremove $vg
+			if [ $? -eq 0 ]; then pvremove $pv; else return 1; fi
+		    fi;;
+	esac
+}
+
+manage_lv() {
+	local mapper=$1
+	local vg=$(find_vg $mapper)
+	local answer= lvmmsg=/tmp/lvm.msg
+
+	while :
+	do
+		clear;
+		cat $lvmmsg 2>/dev/null; rm -f $lvmmsg
+		echo -e "\n\033[1;4mConfiguring volume group '$vg' on device '$mapper':\033[0m"; lvm_table
+		echo -en "\033[4mCreate | Delete | Resize | Mount logical volumes? < 'x' to exit >\033[0m\n"
+		echo -en "\033[1;32m>>>\033[37m[ C | D | R | M | X ]: \033[0m"; read answer
+		echo -en "\033[1A\033[K"
+
+		case $answer in
+		    c*|C*) create_lv $mapper;;
+		    d*|D*) question="DELETE which logical volume"; delete_resize_lv $mapper $answer;;
+		    r*|R*) question="RESIZE which logical volume"; delete_resize_lv $mapper $answer;;
+		    m*|M*) return 0;;
+		    x*|X*) return 1;;
+		esac
+	done
+}
+
+custom_install_lvm_luks() {
+	local diskdev=$1
+	local device=$ACTIVE_DEV type=$ACTIVE_TYPE
+	local fstype=$(find_fs $device) lvmmsg=/tmp/lvm.msg
+	local answer= mnt= vg= lv= mount_list=
+
+	if [ ! "$QUIT" ]; then
+
+		case "$type" in
+		   part) if [ "$fstype" != "crypto_LUKS" ]; then
+				create_crypt $device
+				fstype=$(find_fs $device)
+			fi
+
+			if [ "$fstype" = "crypto_LUKS" ]; then
+				open_crypt $device;
+				device=$(find_dm_by_device $device)
+			fi
+
+			activate_vgs
+
+			if ! is_pv "$device"; then
+				read -p "Configure LVM on '$device'?      [ y/N ] : " answer
+				case "$answer" in
+				   y*|Y*) create_pv $device;
+					  if [ $? -eq 0 ]; then create_vg $device; fi;
+					  if [ $? -eq 0 ]; then manage_lv $device; fi;;
+				       *) mount_list=$device;;
+				esac
+			else
+				read -p "Manage LVM volumes on '$device'? [ Y ] | r <remove> : " answer
+				case "$answer" in
+			          r*|R*) read -p "Continuing will destroy all logical volumes on $device [ y/N ] : " answer
+					  case "$answer" in
+			          y*|Y*) manage_pv $device remove
+					  esac;;
+				      *) create_vg $device;;
+				esac
+				if [ $? -eq 0 ] && is_pv $device; then
+					manage_lv $device;
+				fi
+			fi;;
+		     lvm) mount_list=$device;;
+		   crypt) cryptsetup status $device
+		          read -p "Wipe LUKS header / Reconfigure LUKS on '$device'? [ w/r ]: " answer
+			  case "$answer" in
+			    w*|W*) wipe_crypt $device;;
+			    r*|R*) ;;
+			  esac
+			  ;;
+		esac
+
+		#manage_lv was not exited
+		if [ $? -eq 0 ] && is_pv $device; then
+			vg=$(find_vg $device);
+			if [ -n "$vg" ]; then
+				local lv_list=$(lvs --noheadings $vg|awk '{ print $1 }'|tr "\n" " ")
+				for lv in $lv_list; do
+					mount_list="$mount_list /dev/mapper/$vg-$lv"
+				done
+			fi
+		fi
+
+		for mapper in $mount_list; do
+			mnt=$(find_mount_point $mapper)
+			if [ -z "$mnt" ]; then
+				choose_mount $mapper
+			else
+				read -p "Change Mount point? [$mnt] [y/N]: " answer
+				case "$answer" in
+					y*|Y*) choose_mount $mapper;;
+				esac
+			fi
+			choose_fs $mapper
+			write_mounts $mapper
+		done
+	fi
+}
+
+choose_mount() {
+	local device=$1
+	local mnt=${mnt:-/mnt} answer=
+	local get_requests=$(requested_mnt_fs $device)
+	local requested_mnt=$(echo $get_requests |awk '{ print $1 }')
+
+	if [ -z "$requested_mnt" ]; then # if mnt is not already set
+		local type=$(find_dev_type $device)
+		local part_type=$(find_part_type $device)
+		local fs=$(find_fs $device)
+		local lv= no_mount_list="swap GPT-BIOS"
+
+		case "$type" in
+		   lvm) lv="$(find_lv_by_device $device)"
+			if [ "$fs" = "swap" ] || [ "$lv" = "swap" ]; then
+				mnt=swap
+			fi;;
+		  part) lv="$(basename $device)"
+			if [ "$fs" = "swap" ]; then
+				mnt=swap
+			elif [ "$device" = "$(find_boot_partition)" ]; then
+				lv="boot"
+			fi;;
+		  crypt) lv="$(basename $device)"
+			if [ "$fs" = "swap" ] || [ "$lv" = "swap" ]; then
+				mnt=swap
+			fi;;
+		esac
+
+		case "$part_type" in
+			EF02) mnt="GPT-BIOS";;
+		esac
+
+		if ! echo $lv |grep -qw "root" && ! echo "$no_mount_list" |grep -w "$mnt" 1>/dev/null; then
+			mnt="$mnt/$lv"
+		fi
+	else
+		mnt=$requested_mnt
+	fi
+
+	echo -en "\nEnter Mount point for $device? [ $mnt ] : "; read answer
+	if echo $answer |grep "^/" 1>/dev/null || [ "$answer" = "swap" ]; then
+		mnt=$(sanitize_path $answer)
+	fi
+	ACTIVE_MNT=$mnt
+}
+
+choose_fs() {
+	local device=$1
+	local answer= fs= default_fs=$ROOTFS
+	local fs_list="ext2 ext3 ext4 swap btrfs none"
+	local get_requests=$(requested_mnt_fs $device)
+	local requested_fs=$(echo $get_requests |awk '{ print $2 }')
+
+	if [ -z "$requested_fs" ]; then # if fs is not already set
+		local fs_type=$(find_fs $device)
+		local lv="$(find_lv_by_device $device)"
+		local part_type="$(find_part_type $device)"
+
+		case "$part_type" in
+		   EF02) default_fs="ext3";;
+		   EF00) default_fs="ext2";;
+		   8200) default_fs="swap";;
+	          *) if [ "$fs_type" = "swap" ] || [ "$lv" = "swap" ]; then
+				default_fs="swap"
+		     elif [ "$device" = "$(find_boot_partition)" ]; then
+				default_fs=$BOOTFS
+		     fi;;
+		esac
+	else
+		default_fs=$requested_fs
+	fi
+
+	echo -en "\n\033[4mSelect filesystem to create? [ $default_fs ]: \033[0m\n"
+	until echo $fs_list | grep -w "$fs" &>/dev/null; do
+		echo -en "\033[1;32m>>>\033[37m[ $fs_list = n ]: \033[0m"; read answer
+		echo -en "\033[1A\033[K"
+		case "$answer" in
+		   n*|N*) fs="none";;
+		       *) if [ -z "$answer" ]; then
+				fs=$default_fs
+			  else
+				fs=$answer
+			  fi
+			  ;;
+		esac
+        done
+
+	ACTIVE_FS=$fs
+}
+
+
+detect_disks() {								  # rows to columns
+	local disk_list=$(lsblk -no NAME,SIZE,TYPE 2>/dev/null |awk '$3 = /disk/ { print $1 }' |tr "\n" " ")
+	local disk=
+
+	echo -e "\033[4mNAME SIZE VENDOR LABEL\033[0m" | awk '{ printf "%-14s %-10s %-10s %-10s\n", $1, $2, $3, $4}'
+	lsblk -no NAME,SIZE,TYPE,VENDOR,LABEL 2>/dev/null |awk '$3 = /disk/ { printf "%-10s %-10s %-10s %-10s\n", $1, $2, $4, $5}'
+	echo -en "\n\033[4mChoose Disk\033[0m\n\n"
+	until echo $disk_list | grep -w $disk &> /dev/null; do
+		echo -en "\033[1A\033[K"
+		echo -en "\033[1;32m>>>\033[37m[ $disk_list]: \033[0m"; read disk
+	done
+	ACTIVE_DISK=/dev/$disk
+}
+
+choose_scheme() {
+	local default_scheme= default_layout="none"
+	local scheme_list="gpt mbr" layout_list="lvm boot none"
+	local scheme= layout= answer=
+	local msgfile=/tmp/part.msg
+
+	case "$(check_scheme $ACTIVE_DISK)" in
+	     dos) default_scheme="mbr";;
+	     gpt) default_scheme="gpt";;
+	esac
+
+	echo -en "\n\033[4mChoose Partition Scheme [ $default_scheme ]\033[0m\n\n"
+	until echo $scheme_list | grep -w $scheme &> /dev/null; do
+		echo -en "\033[1A\033[K"
+		echo -en "\033[1;32m>>>\033[37m[ m(br) | g(pt) ]: \033[0m"; read answer
+		case "$answer" in
+		   m*|M*) scheme="mbr";;
+		   g*|G*) scheme="gpt";;
+		       *) scheme=$default_scheme;;
+		esac
+        done
+
+	echo -en "\n\033[4mChoose Disk Layout [ none ]\033[0m\n\n"
+	until echo $layout_list | grep -w $layout &> /dev/null; do
+		echo -en "\033[1A\033[K"
+		echo -en "\033[1;32m>>>\033[37m[ l(vm) | b(oot) | none ]: \033[0m"; read answer
+		case "$answer" in
+		   l*|L*) layout="lvm";
+			     destroy_disks "an LVM Scheme";;
+		   b*|B*) layout="boot";
+			     destroy_disks "a Boot Scheme";;
+		       *) layout=$default_layout;
+			     scheme="manual";;
+		esac
+	done
+
+	case "$scheme" in
+	   mbr) mbr_create $layout;
+		if [ $? = 1 ]; then
+			echo -e "** unhandled error **" >> $msgfile
+		fi;;
+	   gpt) gpt_create $layout;
+		if [ $? = 1 ]; then
+			echo -e "** unhandled gpt error **" >> $msgfile
+		fi;;
+	manual) case "$(check_scheme $ACTIVE_DISK)" in
+		      dos) cfdisk $ACTIVE_DISK;;
+		      gpt) cgdisk $ACTIVE_DISK;;
+		esac
+	esac
+	tidy_mounts
+}
+
+destroy_crypts() {
+	local answer= device= crypt_list=$@
+
+	for device in $crypt_list; do
+		lvm_table
+		read -p "Wipe LUKS header (destroy) '$device'? [ w ]: " answer
+		case "$answer" in
+		  w*|W*) wipe_crypt $device;;
+		      *) ;;
+		esac
+	done
+}
+
+destroy_disks() {
+	local new_scheme=$1
+	local lvm_device=$(find_lvm_partition $ACTIVE_DISK)
+	local crypt_list=$(find_crypts)
+
+	if [ -n "$crypt_list" ]; then
+		destroy_crypts $crypt_list
+	fi
+
+	if is_pv $lvm_device; then
+		lvm_table
+		read -p "Destroy LVM PV '$lvm_device' & replace with $new_scheme ? [ y/N ] : " answer
+		case "$answer" in
+			y*|Y*) manage_pv $lvm_device remove;;
+		esac
+	else
+		if lsblk -o TYPE $ACTIVE_DISK |grep "part" &>/dev/null; then
+			echo -e; lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,UUID $ACTIVE_DISK 2>/dev/null; echo -e;
+			read -p "Destroy current Disk Layout & replace with $new_scheme ? [ y/N ] : " answer
+			case "$answer" in
+			   y*|Y*) ;;
+			       *) scheme="manual";;
+			esac
+		fi
+	fi
+}
+
+mbr_create() {
+	local bootline="2048,204800,83,*"
+	local config=/tmp/mnt_list.in
+
+	if [ "$(check_scheme $ACTIVE_DISK)" = "gpt" ]; then
+		sgdisk --zap $ACTIVE_DISK &>/dev/null
+		if [ -f $config ]; then rm -f $config; fi
+	fi
+
+	case "$1" in
+	   lvm) local lvmline="206848,,8e";
+		echo -e "$bootline\n$lvmline" | sfdisk -q -uS $ACTIVE_DISK &>/dev/null || return 1;;
+	     *) echo -e "$bootline\n$lvmline" | sfdisk -q -uS $ACTIVE_DISK &>/dev/null || return 1;
+		cfdisk $ACTIVE_DISK;;
+	esac
+	cat "$MBR" > $ACTIVE_DISK
+	echo "DOS MBR written to $ACTIVE_DISK" >> $msgfile
+}
+
+gpt_create() {
+	local biosboot=2 bootspace=100 config=/tmp/mnt_list.in msgfile=/tmp/part.msg
+	local diskspace=$(( $(grep ${ACTIVE_DISK#/dev/}$ /proc/partitions | awk '{print $3}') * 2 / 2048 - 1 ))
+	local sys_space=$(( $diskspace - $biosboot - $bootspace - 1 ));
+
+	if [ "$(check_scheme $ACTIVE_DISK)" = "dos" ]; then
+		if [ -f $config ]; then rm -f $config; fi
+	fi
+
+	case "$1" in
+	   lvm) local lvmstring="--new 3:0:+${sys_space}MiB --typecode 3:8e00";
+	        sgdisk $ACTIVE_DISK -go --new 1:0:+${biosboot}MiB --typecode 1:EF02 --new 2:0:+${bootspace}MiB --typecode 2:EF00 $lvmstring &>/dev/null;;
+	     *) sgdisk $ACTIVE_DISK -go --new 1:0:+${biosboot}MiB --typecode 1:EF02 --new 2:0:+${bootspace}MiB --typecode 2:EF00 &>/dev/null;
+	        cgdisk $ACTIVE_DISK;;
+	esac
+	#mark partiton 2 as legacy bootable for syslinux
+	sgdisk -A 2:set:2 $ACTIVE_DISK 1>> $msgfile
+	cat "$GPTMBR" > $ACTIVE_DISK
+	echo "GPT MBR written to $ACTIVE_DISK" >> $msgfile
+}
+
+lvm_table() {
+	echo -e "\n$(pvscan)"
+	echo -e "\n$(lvscan)"
+	if [ -n "$(find_crypts)" ]; then
+		echo -e "\nCrypt Devices:\n"
+		echo -e "$(find_crypts)\n"
+	else
+		echo -e
+	fi
+}
+
+device_from_name() {
+	local name_list=$@
+	local device_type= device= name= device_list=
+
+	for name in $name_list; do
+		device_type=$(dmsetup status $name 2>/dev/null |awk '{ print $3 }')
+		case $device_type in
+		   crypt) device=/dev/mapper/$name;;
+		  linear) device=/dev/mapper/$name;;
+		       *) device=/dev/$name;;
+		esac
+		device_list="${device_list} $device"
+	done
+	echo $device_list
+}
+
+remove_unicode() {
+	echo $@| iconv -c -f utf-8 -t ascii|tr -d '[:*:]'
+}
+
+write_mounts() {
+	local device=$1
+	local uuid=$(_uuid $device)
+	local mntfile=/tmp/mnt_list.in
+	local mnt_line="$device $ACTIVE_MNT $ACTIVE_FS $uuid"
+
+	if grep -q -w "^$device" $mntfile 2>/dev/null; then
+		sed -i "s|^$device.*|$mnt_line|" $mntfile
+	else
+		echo $mnt_line >> $mntfile
+	fi
+}
+
+_uuid() {
+	blkid $1 | awk -F\" '{print $2}'
+}
+
+sanitize_path() {
+	echo $1 |tr -cd '[:alnum:] [:\-:] [:\_:] [:\/:]' |sed 's/-/_/g' |tr -s '/_' |awk '{print tolower($0)}'
+}
+
+sanitize_name() {
+	echo $1 |tr -cd '[:alnum:] [:\-:] [:\_:]' |sed 's/-/_/g' |tr -s '_' |awk '{print tolower($0)}'
+}
+
+check_scheme() {
+	fdisk -l $1 |grep "Disklabel type:" |awk '{ print $3 }'
+}
+
+find_part_type() {
+	local part_number=$(echo $1 |tr -cd '[:digit:]')
+	sgdisk $ACTIVE_DISK -p |sed '1,/Code/d' |awk -v TEST="$part_number" '$1 == TEST { print $6 }'
+
+}
+
+list_devices() {                                                  # needed here to parse standalone luks mapper
+        echo $(lsblk -no NAME,SIZE,TYPE $ACTIVE_DISK 2>/dev/null |iconv -c -f utf-8 -t ascii|tr -d '[:*:]' \
+                |awk '$3 = /part|lvm|crypt/ && $2 != "1K" { print $1}') # extended partition size = 1K
+}
+
+list_partitions() {
+        echo $(lsblk -no NAME,SIZE,TYPE $ACTIVE_DISK 2>/dev/null |iconv -c -f utf-8 -t ascii|tr -d '[:*:]' \
+                |awk '$3 = /part/ && $2 != "1K" { print $1}')
+}
+
+pad_string() {
+	local pad_amount=$2
+	echo "$1" | sed -e :a -e "s/^.\{1,$pad_amount\}$/& /;ta"
+}
+
+show_parts() {
+	local diskdev=$1 device_list=$(list_devices) fstype_pad= name_pad= type_pad= type_adjust= question_adjust= type_file=/tmp/types.list
+	local mntfile=/tmp/mnt_list.in msgfile=/tmp/part.msg parts_file=/tmp/parts.list tmp_file=/tmp/parts.tmp question_line1= question_line2=
+	local part_line= part_line2= part= device= name= type= mnt= fs= fstype= get_requests= mount_pad= part_line_pad= pad_string= question_pad=
+
+	# calculate padding for column headers
+	lsblk -no TYPE,FSTYPE,NAME $ACTIVE_DISK 2>/dev/null | egrep -w 'part|crypt|lvm' > $type_file
+
+	if [ $(grep -w -o '^crypt' $type_file | wc -l) -eq 1 ] && \
+		[ "$(grep ${ACTIVE_DISK##*/} $type_file |tail -1 |awk '{print $2}')" = "crypto_LUKS" ]; then
+		type_adjust=3
+	elif grep -w '^crypt' $type_file 1>/dev/null; then
+		type_adjust=5
+	else
+		type_adjust=2
+	fi
+
+	question_adjust=4
+
+	mount_pad=$(( $(awk '{print $2}' $mntfile 2>/dev/null |awk '{ print length ($0) }' |sort -nr |head -1) + 4))
+	if [ $mount_pad -lt 11 ]; then
+		mount_pad=11
+	fi
+
+	fstype_pad=$(( $(grep ${ACTIVE_DISK##*/} $type_file | awk '{print $2}' | awk '{ print length ($0) }' | sort -nr | head -1) + 4))
+	if [ $fstype_pad -lt 11 ]; then
+		fstype_pad=11
+	fi
+
+	type_pad=$(( $(awk '{print $1}' $type_file | awk '{ print length ($0) }' | sort -nr | head -1) + 4))
+	if [ $type_pad -lt 9 ]; then
+		type_pad=9
+	fi
+	# calculate length of longest string for column headers
+	name_pad=$(( $(lsblk -no NAME,SIZE,TYPE $ACTIVE_DISK 2>/dev/null | rev | cut -f2- | rev | egrep -w 'part|crypt|lvm' \
+		| awk '{ print length ($0) }' | sort -nr | head -1) - $type_adjust))
+
+	echo -en "\033[1;4mAlpine Linux Custom Installation:\n\n\033[0m" > $parts_file
+	cat $msgfile >> $parts_file 2>/dev/null; rm -f $msgfile 2>/dev/null
+	echo -en "\033[1;4mNAME TYPE FSTYPE MOUNT@ FORMAT@\033[0m\n" \
+		| awk -v NAME="$name_pad" -v TYPE="$type_pad" -v FSTYPE="$fstype_pad" -v MOUNT="$mount_pad" \
+		'{ printf "%-" NAME "s%-" TYPE "s%-" FSTYPE "s%-" MOUNT "s%-20s\n",$1,$2,$3,$4,$5}' >> $parts_file
+
+	lsblk -no NAME,SIZE,TYPE $ACTIVE_DISK 2>/dev/null 1>$tmp_file
+	clear;
+
+	for name in $device_list; do
+		device=$(device_from_name $name)
+		fstype=$(find_fs $device)
+		type=$(find_dev_type $name)
+		get_requests=$(requested_mnt_fs $device)
+		set -- $get_requests
+		mnt=$1; fs=$2
+		if [ -z "$fstype" ]; then fstype="---"; fi
+		if [ -z "$mnt" ]; then mnt="---"; fi
+		if [ -z "$fs" ]; then fs="---"; fi
+		part_line=$(grep -w $name $tmp_file | grep -w $type)
+		case "$type" in
+		    crypt) part_line_pad=1;;
+		     part) part_line_pad=2;;
+		      lvm) part_line_pad=3;;
+		esac
+		pad_string=$(pad_string " " $part_line_pad)
+		part_line="$part_line $pad_string"
+		part_line2=$(echo $fstype $mnt $fs |awk -v FSTYPE="$fstype_pad" -v MOUNT="$mount_pad" \
+			 '{ printf "%-" FSTYPE "s%-" MOUNT "s%-20s\n",$1,$2,$3 }')
+		echo -e "$part_line $part_line2" >> $parts_file
+	done
+
+	question_line1="Choose device to configure?"
+	question_line2="[ q to Quit ]"
+	question_pad=$(pad_string " " $(( $name_pad + $type_pad + $fstype_pad + $mount_pad - ${#question_line1} - ${#question_line2} - $question_adjust )) )
+	echo -en "\n\033[4m $question_line1 $question_pad  \033[0m\033[38;5;147m\033[1m $question_line2\033[0;00m\n" >> $parts_file
+	cat $parts_file
+
+	until echo $device_list | grep -w $part &>/dev/null; do
+		echo -en "\033[1;32m>>>\033[37m[ $(echo $device_list |awk '{ print $1,"...",$NF }') ]: \033[0m"; read part
+		echo -en "\033[1A\033[K"
+		if echo $part|egrep -q "^q|^Q"; then QUIT=1; break; fi
+	done
+	if [ "$QUIT" != "1" ]; then
+		ACTIVE_DEV=$(device_from_name $part)
+		ACTIVE_TYPE=$(find_dev_type $part)
+	fi
+}
+
+custom_install() {
+	question=
+	local i= files="mnt_list.in rootdev.first rootdev.last lvm.msg part.msg"
+
+	for i in $files; do rm -f /tmp/$i 2>/dev/null; done
+
+	clear;
+	echo -en "\033[1;4mAlpine Linux Custom Installation:\n\n\033[0m"
+	init_progs_luks || return 1
+	detect_disks
+	detect_mounts
+	unmount_parts
+	choose_scheme
+	activate_vgs
+
+	until [ "$QUIT" ]; do
+		show_parts $ACTIVE_DISK
+		custom_install_lvm_luks
+	done
+
+	unmount_parts
+	format_warning
+	set_lvm_type
+	set_swap_type
+	mount_parts
+}
+
+
+custom_install
