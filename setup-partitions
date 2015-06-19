@@ -276,7 +276,7 @@ format_parts() {
 		case "$3" in
 		      ext*) mkfs.$3 -q $1;;
 		      swap) mkswap $1;swapon $1;;
-		     btrfs) mkfs.$3 $1;;
+		     btrfs) mkfs.$3 -f $1;;
 		         *) echo "NOT formatting $1";;
 		esac
 	fi
@@ -887,7 +887,7 @@ write_mounts() {
 }
 
 _uuid() {
-	blkid $1 | awk -F\" '{print $2}'
+	blkid -o value -s UUID $1
 }
 
 sanitize_path() {
