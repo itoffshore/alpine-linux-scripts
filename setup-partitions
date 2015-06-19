@@ -25,7 +25,7 @@ init_progs_luks() {
 	if [ ! "$(basename $(grep "^http://" /etc/apk/repositories))" = "main" ]; then
 		setup-apkrepos; echo -e;
 	fi
-	pkgs="nano haveged lvm2 cryptsetup sfdisk cfdisk gptfdisk e2fsprogs syslinux"
+	pkgs="nano haveged lvm2 cryptsetup sfdisk cfdisk gptfdisk e2fsprogs btrfs-progs syslinux"
 	for i in $pkgs; do
 		if ! grep "^$i" /etc/apk/world 1>/dev/null; then
 			echo -e "Installing applications for setup ...\n"
@@ -276,7 +276,7 @@ format_parts() {
 		case "$3" in
 		      ext*) mkfs.$3 -q $1;;
 		      swap) mkswap $1;swapon $1;;
-		     btrfs) mkfs.$3 -q $1;;
+		     btrfs) mkfs.$3 $1;;
 		         *) echo "NOT formatting $1";;
 		esac
 	fi
