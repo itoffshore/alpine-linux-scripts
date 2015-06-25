@@ -15,6 +15,14 @@ ACTIVE_FS=
 ACTIVE_TYPE=
 MSG=
 
+# luks defaults
+CIPHER=aes
+MODE=xts
+IV=plain64
+KEYSIZE=256
+HASH=sha512
+ITER=5000
+
 init_progs_luks() {
 	local i=
 
@@ -25,7 +33,7 @@ init_progs_luks() {
 	if [ ! "$(basename $(grep "^http://" /etc/apk/repositories))" = "main" ]; then
 		setup-apkrepos; echo -e;
 	fi
-	pkgs="nano haveged lvm2 cryptsetup sfdisk cfdisk gptfdisk e2fsprogs btrfs-progs syslinux"
+	pkgs="nano haveged lvm2 cryptsetup sfdisk cfdisk gptfdisk e2fsprogs btrfs-progs syslinux dialog"
 	for i in $pkgs; do
 		if ! grep "^$i" /etc/apk/world 1>/dev/null; then
 			echo -e "Installing applications for setup ...\n"
@@ -38,7 +46,7 @@ init_progs_luks() {
 
 confirm_wipe() {
 	#wipe partition with random data
-	echo -n "Wipe LUKS partition: '$1' with random data? [y/N]: "
+	echo -n "Wipe LUKS partition: '$1' with random data? [ y/N ] : "
 	read answer
 	case "$answer" in
 		y*|Y*) `haveged -n 0 | dd of=$1`; return 0;;
@@ -325,40 +333,172 @@ set_swap_type() {
 	done
 }
 
+dialog_cipher() {
+	local current_choice="$CIPHER"
+	CIPHER=$(dialog --item-help --no-tags --default-item "$CIPHER" --keep-tite --ascii-lines \
+		--title "CIPHER" \
+		--menu "\nChoose LUKS Cipher:" 11 30 3 \
+		"aes"     "aes"     "LUKS default & fastest if your hardware supports AES-NI ('grep aes /proc/cpuinfo')." \
+		"twofish" "twofish" "Recommended by Gentoo." \
+		"serpent" "serpent" "Most secure but also the slowest." 3>&1 1>&2 2>&3)
+	if [ -z "$CIPHER" ]; then CIPHER="$current_choice"; fi
+}
+
+dialog_mode() {
+	local current_choice="$MODE"
+	MODE=$(dialog --item-help --no-tags --default-item "$MODE" --keep-tite --ascii-lines \
+		--title "CIPHER MODE" \
+		--menu "\nChoose LUKS Cipher Mode:" 11 30 3 \
+		"cbc" "cbc" "Do NOT use with 'plain' or 'plain64' IV's." \
+		"xts" "xts" "LUKS default: recommended mode & potentially more secure than cbc-essiv." \
+		"ctr" "ctr" "Counter Mode: stream cipher suited to multi-processor systems." 3>&1 1>&2 2>&3)
+	if [ -z "$MODE" ]; then MODE="$current_choice"; fi
+}
+
+dialog_iv() {
+	local current_choice="$IV"
+	IV=$(dialog --item-help --no-tags --default-item "$IV" --keep-tite --ascii-lines \
+		--title "IV" \
+		--menu "\nChoose Initialization Vector:" 12 35 4 \
+		"essiv:sha256" "essiv:sha256" "The **only** IV recommended for 'cbc' mode." \
+		"plain64"      "plain64"      "LUKS default IV - no performance penalty compared to 'plain'" \
+		"plain"        "plain"        "32 bit - do NOT use on disks > 2TiB" \
+		"plain:wd256"  "plain:wd256"  "Recommended by Gentoo with 'twofish-xts'" 3>&1 1>&2 2>&3)
+	if [ -z "$IV" ]; then IV="$current_choice"; fi
+}
+
+dialog_key_size() {
+	local current_choice="$KEYSIZE"
+	KEYSIZE=$(dialog --item-help --no-tags --default-item "$KEYSIZE" --keep-tite --ascii-lines \
+		--title "KEY SIZE" \
+		--menu "\nChoose LUKS Key Size:" 12 30 4 \
+		"128" "128" "128 bits: for passphrases < 128 bits of entropy larger keys are not more secure." \
+		"192" "192" "192 bits: do not use in XTS mode (XTS requires a 256 or 512 bit key)" \
+		"256" "256" "256 bits: LUKS default Key Size (in XTS mode equivalent to 128 bit key)" \
+		"512" "512" "512 bits: in XTS mode equivalent to 256 bit key." 3>&1 1>&2 2>&3)
+	if [ -z "$KEYSIZE" ]; then KEYSIZE="$current_choice"; fi
+}
+
+dialog_hash() {
+	local current_choice="$HASH"
+	HASH=$(dialog --item-help --no-tags --default-item "$HASH" --keep-tite --ascii-lines \
+		--title "ENCRYPTION HASH" \
+		--menu "\nChoose Encryption Hash:" 13 35 5 \
+		"sha512"    "sha512"    "512 bit digest with computed 64 bit words: Recommended on modern hardware." \
+		"sha256"    "sha256"    "256 bit digest with computed 32 bit words: Easier for GPU's to crack." \
+		"sha1"      "sha1"      "160 bit: fastest hash & LUKS default." \
+		"ripemd160" "ripemd160" "160 bit: 2nd fastest hash & dm-crypt default." \
+		"whirlpool" "whirlpool" "512 bit: not curently recommended - see cryptsetup FAQ / gcrypt bug." 3>&1 1>&2 2>&3)
+	if [ -z "$HASH" ]; then HASH="$current_choice"; fi
+}
+
+dialog_iter_time() {
+	local current_choice="$ITER"
+	ITER=$(dialog --keep-tite --ascii-lines --title "ITER TIME" \
+		--inputbox "\nChoose Iter Time" 8 35 "$current_choice" 3>&1 1>&2 2>&3)
+	if [ -z "$ITER" ]; then ITER="$current_choice"; fi
+}
+
+dialog_benchmark() {
+	dialog --title "Cryptsetup Benchmark" --keep-tite --ascii-lines --prgbox " " "cryptsetup benchmark" 25 62
+}
+
+dialog_luks_editor() {
+	local tempfile=/tmp/luksdialog.choice
+	while true; do
+		dialog --clear --default-item "$CHOICE" --item-help --nocancel --extra-button --extra-label "Edit" \
+			--default-button "extra" --help-button --help-label "Benchmark" --keep-tite --ascii-lines \
+			--title "ALPINE LINUX LUKS EDITOR" "$@" \
+			--menu "\nChoose LUKS Encryption Scheme:" 14 39 6 \
+			"Cipher"    "$CIPHER"  "Edit Cipher" \
+			"Mode"      "$MODE"    "Edit Encryption Mode" \
+			"IV"        "$IV"      "Edit Initialization Vector" \
+			"Key Size"  "$KEYSIZE" "Edit Key Size" \
+			"Hash"      "$HASH"    "Edit Encryption Hash" \
+			"Iter Time" "$ITER"    "Time in milliseconds to delay container opening (to slow down Attacks)" 2>$tempfile
+		retval=$?
+		CHOICE=$(cat $tempfile)
+
+		case $retval in
+		  0) break;;
+		  2) dialog_benchmark;;
+		  3) dialog_$(cat $tempfile |tr '[:upper:]' '[:lower:]' |sed 's/ /_/g');;
+		  255) break;;
+		esac
+	done
+}
+
 create_crypt(){
 	local device=$1
 	local answer= config=/tmp/mnt_list.in
 
 	if ! cryptsetup isLuks $device 2>/dev/null; then
-		echo -ne "Create LUKS device on '$device'? [ y/N ] : "; read answer
+		echo -ne "Create LUKS device on '$device' ? [ y/N ] : "; read answer
 		case $answer in
 		   y*|Y*) if is_pv $device; then
-				read -p "$device is an LVM pv. Destroy by creating a LUKS device? [ y/N ] : " answer
+				read -p "$device is an LVM pv. Destroy by creating a LUKS device ? [ y/N ] : " answer
 				case $answer in
 				      y*|Y*) manage_pv $device remove;;
 				esac
 			  fi
 			  if [ $? -eq 0 ]; then
 				confirm_wipe $device
-				cryptsetup -v -c serpent-xts-plain64 -s 512 --hash whirlpool \
-					--iter-time 5000 --use-random luksFormat $device;
-				tidy_mounts $device
+				format_crypt $device
 			  fi;;
 		esac
 	fi
 }
 
-wipe_crypt() {
-	local device=$1
-	local msgfile=/tmp/part.msg
-	local cryptdisk=$(find_mapper_disk $device)
+format_crypt() {
+	local answer= device=$1
+	read -p "LUKS settings: -c $CIPHER-$MODE-$IV -s $KEYSIZE -h $HASH -i $ITER [ c to configure ] : " answer
+	case $answer in
+	  c*|C*) dialog_luks_editor;;
+	esac
 
-	vgchange -a n &>/dev/null
-	cryptsetup close $device
-	dd if=/dev/zero count=2048 of=$cryptdisk &>/dev/null
-	activate_vgs
-	echo -e "LUKS header on '$device' wiped" >> $msgfile
-	tidy_mounts
+	case "$MODE" in
+	  cbc) if [ "$IV" != "essiv:sha256" ]; then
+                        IV='essiv:sha256' # prevent non recommended IV's for CBC Mode
+                        echo "Correcting IV for mode: '$MODE' to: '$IV'"
+		fi;;
+	  xts) if [ "$IV" = "essiv:sha256" ]; then
+                        IV='plain64'      # prevent non recommended IV's for XTS Mode
+                        echo "Correcting IV for mode: '$MODE' to: '$IV'"
+		fi;;
+	esac
+
+	case "$KEYSIZE" in
+	  512) if [ "$MODE" != "xts" ]; then
+                        KEYSIZE=256       # in XTS mode a key of 512 actually = 256 bit key
+                        echo "Correcting Key Size of 512 bits for mode: '$MODE' to: '$KEYSIZE bits' (maximum)"
+		fi;;
+	esac
+
+	echo -e "Creating crypt on $device: -c $CIPHER-$MODE-$IV -s $KEYSIZE -h $HASH -i $ITER --use-random"
+	cryptsetup -c $CIPHER-$MODE-$IV -s $KEYSIZE -h $HASH -i $ITER --use-random luksFormat $device
+	if [ $? -ne 0 ]; then
+		echo -en "\nPress Enter to continue "; read answer
+		return 1
+	else
+		tidy_mounts $device
+	fi
+}
+
+wipe_crypt() {
+        local answer= device=$1
+        local msgfile=/tmp/part.msg
+        local cryptdisk=$(find_mapper_disk $device)
+
+        echo -n "Destroy crypt on: '$device' ? [ y/N ] : "
+        read answer
+        case "$answer" in
+          y*|Y*) vgchange -a n &>/dev/null;
+                cryptsetup close $device
+                dd if=/dev/zero count=2048 of=$cryptdisk &>/dev/null
+                activate_vgs
+                echo -e "LUKS Header on '$device' wiped" >> $msgfile
+                tidy_mounts
+        esac
 }
 
 close_all_crypts() {
@@ -400,7 +540,7 @@ create_vg() {
 	local answer=
 
 	if [ -z "$vg" ]; then
-		read -p "Create LVM volume group on LVM PV '$pv'? [y/N] : " answer
+		read -p "Create LVM volume group on LVM PV '$pv' ? [y/N] : " answer
 		case $answer in
 		   y*|Y*) until [ -n "$(find_vg $pv)" ]; do
 				read -p "Enter name for LVM volume group? : " vg
@@ -451,7 +591,7 @@ delete_resize_lv() {
 	local lv_list=$(lvs --noheadings $vg|awk '{ print $1 }'|tr "\n" " ")
 
 	if [ -n "$lv_list" ]; then
-		echo -en "\n\033[4m$question on '$vg'? [ q to Quit ]\033[0m\n"
+		echo -en "\n\033[4m$question on '$vg' ? [ q to Quit ]\033[0m\n"
 		until echo "$lv_list" | grep -w "$lv" 1>/dev/null; do
 			echo -en "\033[1;32m>>>\033[37m[ $lv_list ]: \033[0m"; read lv
 			echo -en "\033[1A\033[K" #move the cursor & clear the line
@@ -531,10 +671,12 @@ custom_install_lvm_luks() {
 	local answer= mnt= vg= lv= mount_list=
 
 	if [ ! "$QUIT" ]; then
+		while true; do #break out if create_crypt fails
 
 		case "$type" in
 		   part) if [ "$fstype" != "crypto_LUKS" ]; then
 				create_crypt $device
+				if [ $? -ne 0 ]; then break; fi
 				fstype=$(find_fs $device)
 			fi
 
@@ -546,7 +688,7 @@ custom_install_lvm_luks() {
 			activate_vgs
 
 			if ! is_pv "$device"; then
-				read -p "Configure LVM on '$device'?      [ y/N ] : " answer
+				read -p "Configure LVM on '$device' ? [ y/N ] : " answer
 				case "$answer" in
 				   y*|Y*) create_pv $device;
 					  if [ $? -eq 0 ]; then create_vg $device; fi;
@@ -554,7 +696,7 @@ custom_install_lvm_luks() {
 				       *) mount_list=$device;;
 				esac
 			else
-				read -p "Manage LVM volumes on '$device'? [ Y ] | r <remove> : " answer
+				read -p "Manage LVM volumes on '$device' ? [ Y ] | r <remove> : " answer
 				case "$answer" in
 			          r*|R*) read -p "Continuing will destroy all logical volumes on $device [ y/N ] : " answer
 					  case "$answer" in
@@ -568,37 +710,43 @@ custom_install_lvm_luks() {
 			fi;;
 		     lvm) mount_list=$device;;
 		   crypt) cryptsetup status $device
-		          read -p "Wipe LUKS header / Reconfigure LUKS on '$device'? [ w/r ]: " answer
+			  local cryptdisk=$(find_mapper_disk $device)
+		          read -p "Wipe LUKS header & device || Reconfigure LUKS on '$device' ? [ w | r ]: " answer
 			  case "$answer" in
-			    w*|W*) wipe_crypt $device;;
-			    r*|R*) ;;
+			    w*|W*) wipe_crypt $device; confirm_wipe $cryptdisk;;
+			    r*|R*) wipe_crypt $device; create_crypt $cryptdisk;;
 			  esac
 			  ;;
 		esac
 
-		#manage_lv was not exited
-		if [ $? -eq 0 ] && is_pv $device; then
-			vg=$(find_vg $device);
-			if [ -n "$vg" ]; then
-				local lv_list=$(lvs --noheadings $vg|awk '{ print $1 }'|tr "\n" " ")
-				for lv in $lv_list; do
-					mount_list="$mount_list /dev/mapper/$vg-$lv"
-				done
+		#manage_lv was not exited || crypt created successfully
+		if [ $? -eq 0 ]; then
+			if is_pv $device; then
+				vg=$(find_vg $device);
+				if [ -n "$vg" ]; then
+					local lv_list=$(lvs --noheadings $vg|awk '{ print $1 }'|tr "\n" " ")
+					for lv in $lv_list; do
+						mount_list="$mount_list /dev/mapper/$vg-$lv"
+					done
+				fi
 			fi
+
+			for mapper in $mount_list; do
+				mnt=$(find_mount_point $mapper)
+				if [ -z "$mnt" ]; then
+					choose_mount $mapper
+				else
+					read -p "Change Mount point? [$mnt] [y/N]: " answer
+					case "$answer" in
+						y*|Y*) choose_mount $mapper;;
+					esac
+				fi
+				choose_fs $mapper
+				write_mounts $mapper
+			done
 		fi
 
-		for mapper in $mount_list; do
-			mnt=$(find_mount_point $mapper)
-			if [ -z "$mnt" ]; then
-				choose_mount $mapper
-			else
-				read -p "Change Mount point? [$mnt] [y/N]: " answer
-				case "$answer" in
-					y*|Y*) choose_mount $mapper;;
-				esac
-			fi
-			choose_fs $mapper
-			write_mounts $mapper
+		break
 		done
 	fi
 }
@@ -694,19 +842,21 @@ choose_fs() {
 	ACTIVE_FS=$fs
 }
 
+detect_disks() {                                                                           # rows to columns
+        local disk_list=$(lsblk -no NAME,SIZE,TYPE 2>/dev/null |awk '$3 = /disk/ { print $1 }' |tr "\n" " ")
+        local disk= default_disk=$(echo $disk_list |awk '{print $1}')
 
-detect_disks() {								  # rows to columns
-	local disk_list=$(lsblk -no NAME,SIZE,TYPE 2>/dev/null |awk '$3 = /disk/ { print $1 }' |tr "\n" " ")
-	local disk=
-
-	echo -e "\033[4mNAME SIZE VENDOR LABEL\033[0m" | awk '{ printf "%-14s %-10s %-10s %-10s\n", $1, $2, $3, $4}'
-	lsblk -no NAME,SIZE,TYPE,VENDOR,LABEL 2>/dev/null |awk '$3 = /disk/ { printf "%-10s %-10s %-10s %-10s\n", $1, $2, $4, $5}'
-	echo -en "\n\033[4mChoose Disk\033[0m\n\n"
-	until echo $disk_list | grep -w $disk &> /dev/null; do
-		echo -en "\033[1A\033[K"
-		echo -en "\033[1;32m>>>\033[37m[ $disk_list]: \033[0m"; read disk
-	done
-	ACTIVE_DISK=/dev/$disk
+        echo -e "\033[4mNAME SIZE VENDOR LABEL\033[0m" |awk '{ printf "%-14s %-10s %-10s %-10s\n", $1, $2, $3, $4}'
+        lsblk -no NAME,SIZE,TYPE,VENDOR,LABEL 2>/dev/null |awk '$3 = /disk/ { printf "%-10s %-10s %-10s %-10s\n", $1, $2, $4, $5}'
+        echo -en "\n\033[4mChoose Disk [ $default_disk ]\033[0m\n\n"
+        until echo $disk_list | grep -w $disk &> /dev/null; do
+                echo -en "\033[1A\033[K"
+                echo -en "\033[1;32m>>>\033[37m[ $disk_list]: \033[0m"; read disk
+                case "$disk" in
+                  *) if [ -z "$disk" ]; then disk=$default_disk; fi
+                esac
+        done
+        ACTIVE_DISK=/dev/$disk
 }
 
 choose_scheme() {
@@ -767,7 +917,7 @@ destroy_crypts() {
 
 	for device in $crypt_list; do
 		lvm_table
-		read -p "Wipe LUKS header (destroy) '$device'? [ w ]: " answer
+		read -p "Wipe LUKS header (destroy) '$device' ? [ w ] : " answer
 		case "$answer" in
 		  w*|W*) wipe_crypt $device;;
 		      *) ;;
