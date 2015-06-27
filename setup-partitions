@@ -24,12 +24,24 @@ HASH=sha512
 ITER=5000
 
 init_progs_luks() {
-	local i=
+	local i= iface_list= iface_count= iface= route_error=$(route 2>&1 > /dev/null)
 
-	if [ "$(cat /sys/class/net/eth0/operstate)" != "up" ]; then
+	if [ -n "$route_error" ]; then
 		setup-interfaces
-		ifup eth0
+		iface_list=$(ls /sys/class/net |grep -v lo |tr "\n" " ")
+		iface_count=$(echo $iface_list |wc -w)
+		case "$iface_count" in
+		  1) ifup $iface_list;;
+		  0) echo "No interfaces found";;
+		  *) echo -en "\n\033[4mChoose interface to bring up\033[0m\n\n"
+			until echo $iface_list | grep -w $iface &> /dev/null; do
+				echo -en "\033[1A\033[K"
+				echo -en "\033[1;32m>>>\033[37m[ $iface_list]: \033[0m"; read iface
+			done
+			ifup $iface;;
+		esac
 	fi
+
 	if [ ! "$(basename $(grep "^http://" /etc/apk/repositories))" = "main" ]; then
 		setup-apkrepos; echo -e;
 	fi
@@ -593,7 +605,7 @@ delete_resize_lv() {
 	if [ -n "$lv_list" ]; then
 		echo -en "\n\033[4m$question on '$vg' ? [ q to Quit ]\033[0m\n"
 		until echo "$lv_list" | grep -w "$lv" 1>/dev/null; do
-			echo -en "\033[1;32m>>>\033[37m[ $lv_list ]: \033[0m"; read lv
+			echo -en "\033[1;32m>>>\033[37m[ $lv_list]: \033[0m"; read lv
 			echo -en "\033[1A\033[K" #move the cursor & clear the line
 			if echo $lv|egrep "^q|^Q" 1>/dev/null; then answer=cancel; break; fi
 		done
