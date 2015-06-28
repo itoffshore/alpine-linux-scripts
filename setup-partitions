@@ -42,7 +42,7 @@ init_progs_luks() {
 		esac
 	fi
 
-	if [ ! "$(basename $(grep "^http://" /etc/apk/repositories))" = "main" ]; then
+	if [ "$(basename $(grep "^http://" /etc/apk/repositories) 2>/dev/null)" != "main" ]; then
 		setup-apkrepos; echo -e;
 	fi
 	pkgs="nano haveged lvm2 cryptsetup sfdisk cfdisk gptfdisk e2fsprogs btrfs-progs syslinux dialog"
