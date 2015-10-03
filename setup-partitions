@@ -1093,6 +1093,11 @@ show_parts() {
 	# calculate padding for column headers
 	lsblk -no TYPE,FSTYPE,NAME $ACTIVE_DISK 2>/dev/null | egrep -w 'part|crypt|lvm' > $type_file
 
+	# check partitions exist
+	if [ $(wc -l < $type_file) -eq 0 ]; then
+		echo -e "\033[1A\033[K\033[1;31m\nNo partitions exist.\n\033[0m"; exit 1
+	fi
+
 	if [ $(grep -w -o '^crypt' $type_file | wc -l) -eq 1 ] && \
 		[ "$(grep ${ACTIVE_DISK##*/} $type_file |tail -1 |awk '{print $2}')" = "crypto_LUKS" ]; then
 		type_adjust=3
