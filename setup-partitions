@@ -240,10 +240,14 @@ mount_parts() {
 		while read line		#$1 = device
 		do		        #$2 = mount point
 			set -- $line	#$3 = file system
-			if ! echo "$no_mount_list" |grep -w $2 1>/dev/null; then
-				echo "mounting $1 @ $2";
-				mkdir -p $2; mount -t $3 $1 $2;
-			fi
+			if [ -n "$(find_fs $1)" ]; then
+				if ! echo "$no_mount_list" |grep -w $2 1>/dev/null; then
+					echo "mounting $1 @ $2";
+ 					mkdir -p $2; mount -t $3 $1 $2;
+ 				fi
+ 			else
+ 				echo -e "\033[1A\033[K\033[1;31m$1: NO filesystem: NOT mounting.\033[0m"
+ 			fi
 		done < $config
 		echo -e; lsblk -e 1,7,11 -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,PARTLABEL,UUID
 	else
