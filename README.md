@@ -7,8 +7,8 @@ Boot an [Alpine Linux iso](http://alpinelinux.org/downloads/) &:
     ifup eth0
     setup-apkrepos   # choose one near you
     apk add wget ca-certificates
-    wget http://it-offshore.co.uk/alpine/setup-disk
-    wget http://it-offshore.co.uk/alpine/setup-partitions
+    wget http://it-offshore.co.uk/alpine/setup-disk       #redirects to raw github script
+    wget http://it-offshore.co.uk/alpine/setup-partitions #redirects to raw github script
     chmod +x set*
     ./setup-partitions
     ./setup-disk -m sys -E # hard disk encrypted installation
