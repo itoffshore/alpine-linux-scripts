@@ -1057,11 +1057,11 @@ _uuid() {
 }
 
 sanitize_path() {
-	echo $1 |tr -cd '[:alnum:] [:\-:] [:\_:] [:\/:]' |sed 's/-/_/g' |tr -s '/_' |awk '{print tolower($0)}'
+	echo $1 |tr -cd '[:alnum:] [=-=] [=_=] [=/=]' |sed 's/-/_/g' |tr -s '_' |awk '{print tolower($0)}'
 }
 
 sanitize_name() {
-	echo $1 |tr -cd '[:alnum:] [:\-:] [:\_:]' |sed 's/-/_/g' |tr -s '_' |awk '{print tolower($0)}'
+	echo $1 |tr -cd '[:alnum:] [=-=] [=_=]' |sed 's/-/_/g' |tr -s '_' |awk '{print tolower($0)}'
 }
 
 check_scheme() {
