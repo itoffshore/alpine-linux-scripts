@@ -45,7 +45,7 @@ init_progs_luks() {
 	if [ "$(basename $(grep "^http://" /etc/apk/repositories) 2>/dev/null)" != "main" ]; then
 		setup-apkrepos; echo -e;
 	fi
-	pkgs="nano haveged lvm2 cryptsetup sfdisk cfdisk gptfdisk e2fsprogs btrfs-progs syslinux dialog"
+	pkgs="nano haveged lvm2 cryptsetup sfdisk cfdisk gptfdisk e2fsprogs btrfs-progs syslinux dialog util-linux"
 	for i in $pkgs; do
 		if ! grep "^$i" /etc/apk/world 1>/dev/null; then
 			echo -e "Installing applications for setup ...\n"
