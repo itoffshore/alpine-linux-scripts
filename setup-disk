@@ -797,7 +797,7 @@ setup_crypttab() {
 	        y*|Y*) mkdir -p $mnt/etc/conf.d; cp ${config#$mnt} $config
 			ln -s /etc/init.d/dmcrypt $mnt/etc/runlevels/boot/dmcrypt 2>/dev/null
 			read -p "Enter directory for keys [ ${keysdir#$mnt} ]: " answer
-			until [ -d "$keysdir" ]; do
+			until -d "$keysdir"; do
 				if [ -n "$answer" ]; then keysdir=$mnt$answer; fi
 				mkdir -p $keysdir
 			done; echo "Creating $keysdir"
@@ -807,7 +807,7 @@ setup_crypttab() {
 					case "$answer" in
 					  y*|Y*) if ! cryptsetup luksDump $(find_mapper_disk $i)|grep ": DISABLED" 1>/dev/null; then
 							echo "All keyslots full: Choose slot to wipe? [1-7]:"
-							until [ $answer -ge 1 2>/dev/null ] && [ $answer -le 7 2>/dev/null ]; do
+							until $answer -ge 1 2>/dev/null && $answer -le 7 2>/dev/null; do
 								echo -en "\033[1;31m>>>\033[37m: \033[0m"; read answer
 								echo -en "\033[1A\033[K" #move the cursor & clear the line
 							done
@@ -1160,7 +1160,7 @@ if [ -n "$CRYPTROOT" ]; then
 			lvscan |awk '{ print $2,$3,$4 }' |sed "s/'//g"
 			echo -en "\nSelect root device?\n\n"					# rows to columns
 			part_list=$(lvscan |awk '{ print $2 }' |sed "s:/dev/$(find_luks_vg)/::g"|tr "\n" " ")
-			until [ -n "$(find_mount_point $(convert_lv_to_device $answer))" &>/dev/null ]; do
+			until -n "$(find_mount_point $(convert_lv_to_device $answer))" &>/dev/null; do
 				if [ -n "$answer" ]; then echo -e "\033[1;31m$answer: not mounted";sleep 1;echo -en "\033[1A\033[K";fi
 				echo -en "\033[1;32m>>>\033[37m[ $part_list]: \033[0m"; read answer
 				echo -en "\033[1A\033[K"
